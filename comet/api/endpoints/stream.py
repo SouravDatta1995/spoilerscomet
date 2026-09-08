@@ -410,6 +410,7 @@ async def stream(
     )
 
     added_hashes = set()
+    cached_playable_count = 0
 
     for info_hash in ranked_info_hashes:
         torrent = torrents[info_hash]
@@ -487,6 +488,7 @@ async def stream(
 
             if is_cached:
                 added_hashes.add(info_hash)
+                cached_playable_count += 1
 
             if sort_mixed or is_cached:
                 cached_results.append(the_stream)
@@ -537,7 +539,11 @@ async def stream(
 
     if sort_mixed:
         final_streams = cached_results
+    elif cached_playable_count > 0:
+        # Smart Fallback: cachedOnly first! If cached streams exist, return ONLY cached streams.
+        final_streams = cached_results
     else:
+        # If 0 cached streams exist on debrid, fall back to returning uncached download streams
         final_streams = cached_results + non_cached_results
 
     has_results = len(final_streams) > 0

@@ -1,4 +1,6 @@
 import asyncio
+import aiohttp
+import re
 
 from comet.core.constants import INDEXER_TIMEOUT
 from comet.core.logger import logger
@@ -17,10 +19,31 @@ from comet.services.torrent_manager import (
     extract_trackers_from_magnet,
 )
 
+# Slow, Cloudflare-protected, or non-magnet indexers to exclude ONLY during live searches
+# (These are 100% enabled and used by the background scraper)
+SLOW_INDEXER_PATTERNS = [r"limetorrents", r"torrentproject", r"yts", r"1337x", r"1337"]
 
 class ProwlarrScraper(BaseScraper):
     def __init__(self, manager, session, url: str):
         super().__init__(manager, session, url)
+        self._indexer_cache = {}
+
+    async def _get_indexer_info(self):
+        try:
+            async with self.session.get(
+                f"{self.url}/api/v1/indexer",
+                headers={"X-Api-Key": settings.PROWLARR_API_KEY},
+                timeout=5.0,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    self._indexer_cache = {
+                        str(idx["id"]): idx.get("name", "").lower()
+                        for idx in data
+                        if isinstance(idx, dict) and "id" in idx
+                    }
+        except Exception:
+            pass
 
     async def process_torrent(self, result: dict, media_id: str, season: int):
         base_torrent = {
@@ -37,9 +60,12 @@ class ProwlarrScraper(BaseScraper):
 
         torrents = []
 
-        if "downloadUrl" in result:
+        if "downloadUrl" in result and settings.DOWNLOAD_TORRENT_FILES:
+            download_url = result["downloadUrl"]
+            if self.url:
+                download_url = re.sub(r"^https?://(localhost|127\.0\.0\.1):9696", self.url.rstrip("/"), download_url)
             content, magnet_hash, magnet_url = await download_torrent(
-                self.session, result["downloadUrl"]
+                self.session, download_url
             )
 
             if content:
@@ -89,18 +115,20 @@ class ProwlarrScraper(BaseScraper):
 
         return torrents
 
-    async def _fetch_search_results(self, query):
+    async def _fetch_search_results(self, query, indexer_ids, is_live=True):
         url = f"{self.url}/api/v1/search"
         params = [
             ("query", query),
-            *(("indexerIds", indexer_id) for indexer_id in settings.PROWLARR_INDEXERS),
+            *(("indexerIds", indexer_id) for indexer_id in indexer_ids),
             ("type", "search"),
         ]
+        # 3.5s timeout for live searches so TorrentProject2 (2.9s) returns without hitting AIOStreams 10s limit; 45s for background
+        timeout_val = aiohttp.ClientTimeout(total=3.5) if is_live else aiohttp.ClientTimeout(total=45)
         async with self.session.get(
             url,
             params=params,
             headers={"X-Api-Key": settings.PROWLARR_API_KEY},
-            timeout=INDEXER_TIMEOUT,
+            timeout=timeout_val,
         ) as response:
             if response.status != 200:
                 raise RuntimeError(f"HTTP {response.status}")
@@ -126,16 +154,39 @@ class ProwlarrScraper(BaseScraper):
             logger.warning("No Prowlarr indexers available, skipping scrape.")
             return []
 
+        # Update indexer name cache if empty
+        if not self._indexer_cache:
+            await self._get_indexer_info()
+
+        is_live = getattr(request.context, "value", str(request.context)).lower() == "live"
+        target_indexers = settings.PROWLARR_INDEXERS
+        if is_live:
+            target_indexers = [
+                i
+                for i in target_indexers
+                if not any(
+                    re.search(pat, self._indexer_cache.get(str(i), "").lower())
+                    for pat in SLOW_INDEXER_PATTERNS
+                )
+            ]
+        active_names = [self._indexer_cache.get(str(i), str(i)) for i in target_indexers]
+        logger.log("SCRAPER", f"Prowlarr search ({'live' if is_live else 'background'}) using {len(target_indexers)} indexers: {', '.join(active_names)}")
+
         torrents: list[ScrapeResult] = []
         seen: set[str] = set()
 
-        queries = request.title_queries(include_episode_variants=True)
+        if is_live:
+            # For live search, use primary clean title so Prowlarr finishes in < 1.5s
+            clean_title = re.sub(r'[:\-–—].*$', '', request.title).strip()
+            queries = [clean_title]
+        else:
+            queries = request.title_queries(include_episode_variants=True)
 
         try:
             responses = await gather_with_error_logging(
                 (
                     f"Prowlarr query {query!r} ({self.url})",
-                    self._fetch_search_results(query),
+                    self._fetch_search_results(query, target_indexers, is_live=is_live),
                 )
                 for query in queries
             )

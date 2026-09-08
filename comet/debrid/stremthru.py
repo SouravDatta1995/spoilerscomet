@@ -280,17 +280,48 @@ class StremThru:
     ):
         await self.check_premium()
 
-        chunk_size = 500
+        # Sort candidate hashes by seeders descending so the highest quality/most popular torrents are in lot #1
+        def get_seeders(h):
+            val = seeders_map.get(h)
+            return val if isinstance(val, (int, float)) else 0
+
+        sorted_hashes = sorted(
+            torrent_hashes,
+            key=get_seeders,
+            reverse=True,
+        )
+
+        chunk_size = 100
         chunks = [
-            torrent_hashes[i : i + chunk_size]
-            for i in range(0, len(torrent_hashes), chunk_size)
+            sorted_hashes[i : i + chunk_size]
+            for i in range(0, len(sorted_hashes), chunk_size)
         ]
 
-        tasks = []
-        for chunk in chunks:
-            tasks.append(self.get_instant(chunk))
-
-        responses = await asyncio.gather(*tasks)
+        responses = []
+        is_offcloud = self.store_name == "offcloud"
+        for lot_idx, chunk in enumerate(chunks, start=1):
+            top_s = get_seeders(chunk[0]) if chunk else 0
+            logger.log(
+                "SCRAPER",
+                f"🔎 [TorBox Progressive] Checking lot #{lot_idx}/{len(chunks)} ({len(chunk)} torrents, top seeders: {top_s})...",
+            )
+            resp = await self.get_instant(chunk)
+            if resp:
+                responses.append(resp)
+                cached_in_lot, _ = _prepare_cached_torrents(
+                    [resp], is_offcloud=is_offcloud
+                )
+                if cached_in_lot:
+                    logger.log(
+                        "SCRAPER",
+                        f"⚡ [TorBox Progressive] Found {len(cached_in_lot)} cached torrents in lot #{lot_idx}! Stopping early (only {min(lot_idx * chunk_size, len(sorted_hashes))}/{len(sorted_hashes)} checked).",
+                    )
+                    break
+                else:
+                    logger.log(
+                        "SCRAPER",
+                        f"⏳ [TorBox Progressive] Lot #{lot_idx} had 0 cached torrents on {self.store_name}. Checking next lot...",
+                    )
 
         is_offcloud = self.store_name == "offcloud"
         cached_torrents, filenames_to_parse = _prepare_cached_torrents(
