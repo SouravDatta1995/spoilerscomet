@@ -37,3 +37,17 @@ def normalize_scraper_timeout_selector(selector: str) -> str:
             f"invalid scraper timeout context in selector: {selector!r}"
         ) from None
     return f"{scraper_name}:{context.value}"
+
+
+_last_live_scrape_time: float = 0.0
+
+
+def record_live_scrape() -> None:
+    global _last_live_scrape_time
+    import time
+    _last_live_scrape_time = time.time()
+
+
+def get_last_live_scrape_time() -> float:
+    return _last_live_scrape_time
+

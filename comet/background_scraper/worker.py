@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 from comet.core.database import database
 from comet.core.logger import logger
-from comet.core.models import settings
-from comet.core.scrape import ScrapeContext
+from comet.core.models import IS_SQLITE, settings
+from comet.core.scrape import ScrapeContext, get_last_live_scrape_time
 from comet.metadata.manager import MetadataScraper
 from comet.observability import metrics
 from comet.services.cache_state import mark_scope_scraped
@@ -502,6 +502,9 @@ class BackgroundScraperWorker:
                 return False
 
             await self._wait_if_paused()
+            if not self.is_running:
+                return False
+            await self._wait_if_live_traffic_active()
             if not self.is_running:
                 return False
             if deadline is not None and time.time() > deadline:
@@ -1056,6 +1059,74 @@ class BackgroundScraperWorker:
             return
         await self.pause_event.wait()
 
+    async def _wait_if_live_traffic_active(self):
+        deference_window = (
+            getattr(settings, "BACKGROUND_SCRAPER_LIVE_DEFERENCE_SECONDS", 45) or 0
+        )
+        if deference_window <= 0:
+            return
+
+        while self.is_running:
+            last_live = get_last_live_scrape_time()
+            elapsed = time.time() - last_live
+            if elapsed < deference_window:
+                wait_time = min(5.0, deference_window - elapsed)
+                logger.log(
+                    "BACKGROUND_SCRAPER",
+                    f"Live user playback/search detected ({elapsed:.1f}s ago). "
+                    f"Yielding background scraper for {wait_time:.1f}s to prioritize live traffic...",
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                break
+
+    async def _get_blocked_candidate_ids(
+        self,
+        candidate_ids: list[str],
+        media_type: str,
+        now: float,
+        success_cutoff: float,
+    ) -> set[str]:
+        if not candidate_ids:
+            return set()
+
+        blocked_ids: set[str] = set()
+        chunk_size = 200
+        for i in range(0, len(candidate_ids), chunk_size):
+            chunk = candidate_ids[i : i + chunk_size]
+            placeholders = ", ".join(f":id_{idx}" for idx in range(len(chunk)))
+            params = {f"id_{idx}": cid for idx, cid in enumerate(chunk)}
+            params.update(
+                {
+                    "media_type": media_type,
+                    "now": now,
+                    "success_cutoff": success_cutoff,
+                }
+            )
+            query = f"""
+                SELECT media_id
+                FROM background_scraper_items
+                WHERE media_id IN ({placeholders})
+                  AND media_type = :media_type
+                  AND (
+                        (next_retry_at IS NOT NULL AND next_retry_at > :now)
+                        OR (last_success_at IS NOT NULL AND last_success_at > :success_cutoff)
+                      )
+            """
+            rows = await database.fetch_all(query, params)
+            for row in rows:
+                blocked_ids.add(row["media_id"])
+
+        return blocked_ids
+
+    async def _is_discovery_candidate_blocked(
+        self, media_id: str, media_type: str, now: float, success_cutoff: float
+    ) -> bool:
+        blocked = await self._get_blocked_candidate_ids(
+            [media_id], media_type, now, success_cutoff
+        )
+        return media_id in blocked
+
     async def _discover_media_type(
         self, session, media_type: str, max_discovery_items: int
     ) -> int:
@@ -1068,6 +1139,37 @@ class BackgroundScraperWorker:
         current_year = time.gmtime().tm_year
         success_cutoff = now - settings.BACKGROUND_SCRAPER_SUCCESS_TTL
         blocked_cache: dict[str, bool] = {}
+        pending_candidates: list[dict] = []
+
+        async def _flush_pending():
+            nonlocal discovered
+            if not pending_candidates:
+                return
+
+            uncached_ids = [
+                item["media_id"]
+                for item in pending_candidates
+                if item["media_id"] not in blocked_cache
+            ]
+            if uncached_ids:
+                blocked_set = await self._get_blocked_candidate_ids(
+                    uncached_ids, media_type, now, success_cutoff
+                )
+                for mid in uncached_ids:
+                    blocked_cache[mid] = mid in blocked_set
+
+            for item in pending_candidates:
+                if discovered >= max_discovery_items:
+                    break
+                if blocked_cache.get(item["media_id"]):
+                    continue
+                batch.append(item)
+                discovered += 1
+                if len(batch) >= 200:
+                    await self._upsert_discovered_items(batch)
+                    batch.clear()
+
+            pending_candidates.clear()
 
         async with CinemataClient(session=session) as cinemata_client:
             async for media_item in cinemata_client.fetch_all_of_type(media_type):
@@ -1083,58 +1185,19 @@ class BackgroundScraperWorker:
                 if not normalized:
                     continue
 
-                media_id = normalized["media_id"]
-                if media_id in blocked_cache:
-                    blocked = blocked_cache[media_id]
-                else:
-                    blocked = await self._is_discovery_candidate_blocked(
-                        media_id=media_id,
-                        media_type=media_type,
-                        now=now,
-                        success_cutoff=success_cutoff,
-                    )
-                    blocked_cache[media_id] = blocked
-                if blocked:
-                    continue
-
-                batch.append(normalized)
-                discovered += 1
-
-                if len(batch) >= 200:
-                    await self._upsert_discovered_items(batch)
-                    batch.clear()
+                pending_candidates.append(normalized)
+                if len(pending_candidates) >= 200:
+                    await _flush_pending()
 
                 if discovered >= max_discovery_items:
                     break
+
+        await _flush_pending()
 
         if batch:
             await self._upsert_discovered_items(batch)
 
         return discovered
-
-    async def _is_discovery_candidate_blocked(
-        self, media_id: str, media_type: str, now: float, success_cutoff: float
-    ) -> bool:
-        blocked = await database.fetch_val(
-            """
-            SELECT 1
-            FROM background_scraper_items
-            WHERE media_id = :media_id
-              AND media_type = :media_type
-              AND (
-                    (next_retry_at IS NOT NULL AND next_retry_at > :now)
-                    OR (last_success_at IS NOT NULL AND last_success_at > :success_cutoff)
-                  )
-            LIMIT 1
-            """,
-            {
-                "media_id": media_id,
-                "media_type": media_type,
-                "now": now,
-                "success_cutoff": success_cutoff,
-            },
-        )
-        return bool(blocked)
 
     def _normalize_media_item(
         self, media_item: dict, media_type: str, now: float, current_year: int
@@ -1228,37 +1291,36 @@ class BackgroundScraperWorker:
         demand_enabled = 1 if settings.BACKGROUND_SCRAPER_ENABLE_DEMAND_PRIORITY else 0
         min_priority_score = max(0.0, settings.BACKGROUND_SCRAPER_MIN_PRIORITY_SCORE)
 
+        root_id_expr = (
+            "substr(md.media_id, 1, instr(md.media_id || ':', ':') - 1)"
+            if IS_SQLITE
+            else "split_part(md.media_id, ':', 1)"
+        )
+
         rows = await database.fetch_all(
-            """
-            WITH demand_ids AS (
-                SELECT DISTINCT md.media_id
+            f"""
+            WITH demand_roots AS (
+                SELECT DISTINCT {root_id_expr} AS root_id
                 FROM media_demand md
                 WHERE :demand_enabled = 1
                   AND md.last_seen_at >= :demand_cutoff
-            ),
-            demand_matches AS (
-                SELECT DISTINCT i.media_id
-                FROM background_scraper_items i
-                JOIN demand_ids d
-                  ON d.media_id = i.media_id
-                  OR d.media_id LIKE i.media_id || :series_media_id_like_suffix
             )
             SELECT i.media_id, i.media_type, i.title, i.year, i.year_end, i.priority_score,
                    i.consecutive_failures, i.status,
-                   CASE WHEN d.media_id IS NOT NULL THEN 100.0 ELSE 0.0 END AS demand_boost
+                   CASE WHEN d.root_id IS NOT NULL THEN 100.0 ELSE 0.0 END AS demand_boost
             FROM background_scraper_items i
-            LEFT JOIN demand_matches d ON d.media_id = i.media_id
+            LEFT JOIN demand_roots d ON d.root_id = i.media_id
             WHERE i.media_type = :media_type
               AND (i.next_retry_at IS NULL OR i.next_retry_at <= :now)
               AND (i.last_success_at IS NULL OR i.last_success_at <= :success_cutoff)
               AND (i.status != 'dead' OR i.consecutive_failures < :max_retries)
               AND (
                     i.priority_score >= :min_priority_score
-                    OR d.media_id IS NOT NULL
+                    OR d.root_id IS NOT NULL
                     OR i.consecutive_failures > 0
                   )
             ORDER BY
-              (i.priority_score + CASE WHEN d.media_id IS NOT NULL THEN 100.0 ELSE 0.0 END) DESC,
+              (i.priority_score + CASE WHEN d.root_id IS NOT NULL THEN 100.0 ELSE 0.0 END) DESC,
               COALESCE(i.last_scraped_at, 0) ASC
             LIMIT :limit
             """,
@@ -1271,7 +1333,6 @@ class BackgroundScraperWorker:
                 "limit": limit,
                 "demand_enabled": demand_enabled,
                 "min_priority_score": min_priority_score,
-                "series_media_id_like_suffix": ":%",
             },
         )
 
@@ -1378,10 +1439,83 @@ class BackgroundScraperWorker:
         if not episodes:
             return 0
 
+        resolved_episodes: set[str] = set()
+        season_pack_enabled = getattr(
+            settings, "BACKGROUND_SCRAPER_SEASON_PACK_FIRST", True
+        )
+        if season_pack_enabled:
+            seasons = sorted(set(ep["season"] for ep in episodes))
+            for season in seasons:
+                if not self.is_running:
+                    break
+                await self._wait_if_paused()
+                if not self.is_running:
+                    break
+                await self._wait_if_live_traffic_active()
+                if not self.is_running:
+                    break
+                if deadline is not None and time.time() > deadline:
+                    break
+
+                season_episodes = [
+                    ep for ep in episodes if ep["season"] == season
+                ]
+                season_media_id = f"{media_id}:{season}"
+                try:
+                    season_manager = TorrentManager(
+                        media_type="series",
+                        media_full_id=season_media_id,
+                        media_only_id=media_id,
+                        title=metadata["title"],
+                        year=metadata["year"],
+                        year_end=metadata["year_end"],
+                        season=season,
+                        episode=None,
+                        aliases=aliases,
+                        remove_adult_content=settings.REMOVE_ADULT_CONTENT,
+                    )
+                    await season_manager.scrape_torrents(ScrapeContext.BACKGROUND)
+                    season_torrents = len(season_manager.torrents)
+
+                    has_season_pack = False
+                    for t in season_manager.torrents.values():
+                        parsed = t.get("parsed")
+                        if not parsed:
+                            continue
+                        p_seasons = getattr(parsed, "seasons", None) or []
+                        p_episodes = getattr(parsed, "episodes", None) or []
+                        if season in p_seasons and (
+                            not p_episodes or len(p_episodes) > 1
+                        ):
+                            has_season_pack = True
+                            break
+
+                    if has_season_pack and season_torrents > 0:
+                        logger.log(
+                            "BACKGROUND_SCRAPER",
+                            f"Season pack verified for {media_id} S{season:02d} "
+                            f"({season_torrents} torrents). Auto-resolving {len(season_episodes)} episodes.",
+                        )
+                        await self._batch_update_episodes_success(
+                            season_episodes, season_torrents
+                        )
+                        for ep in season_episodes:
+                            resolved_episodes.add(ep["episode_media_id"])
+                        total_torrents += season_torrents
+                except Exception as e:
+                    logger.warning(
+                        f"Background season pack scrape skipped for {season_media_id}: {e}"
+                    )
+
         for episode in episodes:
+            if episode["episode_media_id"] in resolved_episodes:
+                continue
             if not self.is_running:
                 break
             await self._wait_if_paused()
+            if not self.is_running:
+                break
+            await self._wait_if_live_traffic_active()
             if not self.is_running:
                 break
 
@@ -1426,6 +1560,50 @@ class BackgroundScraperWorker:
             total_torrents += episode_torrents
 
         return total_torrents
+
+    async def _batch_update_episodes_success(
+        self, episodes: list[dict], torrents_found: int
+    ):
+        if not episodes:
+            return
+
+        now = time.time()
+        next_retry_at = now + settings.BACKGROUND_SCRAPER_SUCCESS_TTL
+        chunk_size = 200
+
+        for i in range(0, len(episodes), chunk_size):
+            chunk = episodes[i : i + chunk_size]
+            placeholders = ", ".join(f":id_{idx}" for idx in range(len(chunk)))
+            params = {
+                f"id_{idx}": ep["episode_media_id"] for idx, ep in enumerate(chunk)
+            }
+            params.update(
+                {
+                    "now": now,
+                    "next_retry_at": next_retry_at,
+                    "torrents_found": torrents_found,
+                }
+            )
+            await database.execute(
+                f"""
+                UPDATE background_scraper_episodes
+                SET status = 'success',
+                    consecutive_failures = 0,
+                    last_scraped_at = :now,
+                    last_success_at = :now,
+                    last_failure_at = NULL,
+                    next_retry_at = :next_retry_at,
+                    total_torrents_found = COALESCE(total_torrents_found, 0) + :torrents_found,
+                    updated_at = :now
+                WHERE episode_media_id IN ({placeholders})
+                """,
+                params,
+            )
+
+        for ep in episodes:
+            ep["consecutive_failures"] = 0
+            ep["status"] = "success"
+            await mark_scope_scraped(ep["episode_media_id"])
 
     async def _get_or_discover_episodes(self, series_id: str):
         now = time.time()

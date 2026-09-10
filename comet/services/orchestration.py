@@ -6,7 +6,7 @@ from RTN import DefaultRanking, ParsedData
 from comet.core.execution import get_executor
 from comet.core.logger import logger
 from comet.core.models import CometSettingsModel, database, settings
-from comet.core.scrape import ScrapeContext
+from comet.core.scrape import ScrapeContext, record_live_scrape
 from comet.scrapers.manager import scraper_manager
 from comet.scrapers.models import ScrapeRequest
 from comet.services.filtering import filter_worker
@@ -134,6 +134,9 @@ class TorrentManager:
         self,
         context: ScrapeContext,
     ):
+        if context == ScrapeContext.LIVE:
+            record_live_scrape()
+
         request = ScrapeRequest(
             media_type=self.media_type,
             media_id=self.media_id,

@@ -1,6 +1,7 @@
 import asyncio
 import math
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -490,6 +491,280 @@ class BackgroundWorkerQueryTests(unittest.IsolatedAsyncioTestCase):
         for row in invalid_rows:
             with self.subTest(row=row), self.assertRaises((TypeError, ValueError)):
                 _serialize_run_row(row)
+
+
+class BackgroundWorkerPhase1Tests(unittest.IsolatedAsyncioTestCase):
+    async def test_get_blocked_candidate_ids_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = await _create_queue_database(Path(temp_dir) / "queue.db")
+            try:
+                await database.execute_many(
+                    """
+                    INSERT INTO background_scraper_items
+                    (media_id, media_type, next_retry_at, last_success_at, status, consecutive_failures, created_at)
+                    VALUES (:media_id, :media_type, :next_retry_at, :last_success_at, :status, :consecutive_failures, :created_at)
+                    """,
+                    [
+                        {
+                            "media_id": "tt_blocked_retry",
+                            "media_type": "movie",
+                            "next_retry_at": 150.0,
+                            "last_success_at": None,
+                            "status": "deferred",
+                            "consecutive_failures": 0,
+                            "created_at": 10.0,
+                        },
+                        {
+                            "media_id": "tt_blocked_success",
+                            "media_type": "movie",
+                            "next_retry_at": None,
+                            "last_success_at": 95.0,
+                            "status": "success",
+                            "consecutive_failures": 0,
+                            "created_at": 10.0,
+                        },
+                        {
+                            "media_id": "tt_ready_retry",
+                            "media_type": "movie",
+                            "next_retry_at": 80.0,
+                            "last_success_at": None,
+                            "status": "failed",
+                            "consecutive_failures": 1,
+                            "created_at": 10.0,
+                        },
+                    ],
+                )
+
+                worker = BackgroundScraperWorker()
+                with patch("comet.background_scraper.worker.database", database):
+                    blocked = await worker._get_blocked_candidate_ids(
+                        ["tt_blocked_retry", "tt_blocked_success", "tt_ready_retry", "tt_nonexistent"],
+                        media_type="movie",
+                        now=100.0,
+                        success_cutoff=90.0,
+                    )
+                    self.assertIn("tt_blocked_retry", blocked)
+                    self.assertIn("tt_blocked_success", blocked)
+                    self.assertNotIn("tt_ready_retry", blocked)
+                    self.assertNotIn("tt_nonexistent", blocked)
+
+                    # Also test single-item wrapper
+                    self.assertTrue(
+                        await worker._is_discovery_candidate_blocked(
+                            "tt_blocked_retry", "movie", now=100.0, success_cutoff=90.0
+                        )
+                    )
+                    self.assertFalse(
+                        await worker._is_discovery_candidate_blocked(
+                            "tt_ready_retry", "movie", now=100.0, success_cutoff=90.0
+                        )
+                    )
+            finally:
+                await database.disconnect()
+
+    async def test_plan_items_sargable_demand_matching(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = await _create_queue_database(Path(temp_dir) / "plan.db")
+            try:
+                await database.execute(
+                    """
+                    CREATE TABLE media_demand (
+                        media_id TEXT PRIMARY KEY,
+                        last_seen_at REAL NOT NULL
+                    )
+                    """
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN title TEXT NOT NULL DEFAULT ''"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN year INTEGER NOT NULL DEFAULT 2024"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN year_end INTEGER"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN priority_score REAL NOT NULL DEFAULT 10.0"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN last_scraped_at REAL"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_items ADD COLUMN updated_at REAL"
+                )
+
+                # Insert items
+                await database.execute_many(
+                    """
+                    INSERT INTO background_scraper_items
+                    (media_id, media_type, title, priority_score, status, consecutive_failures, created_at)
+                    VALUES (:media_id, :media_type, :title, :priority_score, 'discovered', 0, 10.0)
+                    """,
+                    [
+                        {"media_id": "tt_series_demand", "media_type": "series", "title": "Series Demand", "priority_score": 10.0},
+                        {"media_id": "tt_series_normal", "media_type": "series", "title": "Series Normal", "priority_score": 10.0},
+                        {"media_id": "tt_movie_demand", "media_type": "movie", "title": "Movie Demand", "priority_score": 5.0},
+                    ],
+                )
+
+                # Insert demand: series demand has episode suffix, movie demand has root id
+                now = time.time()
+                await database.execute_many(
+                    """
+                    INSERT INTO media_demand (media_id, last_seen_at)
+                    VALUES (:media_id, :last_seen_at)
+                    """,
+                    [
+                        {"media_id": "tt_series_demand:1:1", "last_seen_at": now - 5.0},
+                        {"media_id": "tt_movie_demand", "last_seen_at": now - 5.0},
+                    ],
+                )
+
+                worker = BackgroundScraperWorker()
+                with (
+                    patch("comet.background_scraper.worker.database", database),
+                    patch.object(settings, "BACKGROUND_SCRAPER_ENABLE_DEMAND_PRIORITY", True),
+                    patch.object(settings, "BACKGROUND_SCRAPER_DEMAND_LOOKBACK", 50),
+                    patch.object(settings, "BACKGROUND_SCRAPER_SUCCESS_TTL", 604800),
+                ):
+                    series_plan = await worker._plan_items("series", 10)
+                    self.assertEqual(len(series_plan), 2)
+                    # The series with demand boost (+100) should be first
+                    self.assertEqual(series_plan[0]["media_id"], "tt_series_demand")
+                    self.assertEqual(series_plan[0]["demand_boost"], 100.0)
+                    self.assertEqual(series_plan[1]["media_id"], "tt_series_normal")
+                    self.assertEqual(series_plan[1]["demand_boost"], 0.0)
+
+                    movie_plan = await worker._plan_items("movie", 10)
+                    self.assertEqual(len(movie_plan), 1)
+                    self.assertEqual(movie_plan[0]["media_id"], "tt_movie_demand")
+                    self.assertEqual(movie_plan[0]["demand_boost"], 100.0)
+            finally:
+                await database.disconnect()
+
+    async def test_live_traffic_deference_pauses_worker(self):
+        worker = BackgroundScraperWorker()
+        worker.is_running = True
+
+        sleep_calls = []
+        async def fake_sleep(dur):
+            sleep_calls.append(dur)
+            worker.is_running = False  # break out of loop after first wait
+
+        with (
+            patch("comet.background_scraper.worker.get_last_live_scrape_time", return_value=100.0),
+            patch("time.time", return_value=110.0),  # 10s elapsed
+            patch.object(settings, "BACKGROUND_SCRAPER_LIVE_DEFERENCE_SECONDS", 45),
+            patch("asyncio.sleep", fake_sleep),
+        ):
+            await worker._wait_if_live_traffic_active()
+
+        # Should have waited since elapsed (10s) < deference (45s)
+        self.assertTrue(len(sleep_calls) > 0)
+        self.assertAlmostEqual(sleep_calls[0], 5.0)
+
+    async def test_batch_update_episodes_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = await _create_queue_database(Path(temp_dir) / "episodes.db")
+            try:
+                await database.execute(
+                    "ALTER TABLE background_scraper_episodes ADD COLUMN episode_media_id TEXT"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_episodes ADD COLUMN last_scraped_at REAL"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_episodes ADD COLUMN last_failure_at REAL"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_episodes ADD COLUMN total_torrents_found INTEGER DEFAULT 0"
+                )
+                await database.execute(
+                    "ALTER TABLE background_scraper_episodes ADD COLUMN updated_at REAL"
+                )
+
+                await database.execute_many(
+                    """
+                    INSERT INTO background_scraper_episodes
+                    (episode_media_id, series_id, season, episode, status, consecutive_failures, created_at)
+                    VALUES (:episode_media_id, :series_id, :season, :episode, 'discovered', 1, 10.0)
+                    """,
+                    [
+                        {"episode_media_id": "tt100:1:1", "series_id": "tt100", "season": 1, "episode": 1},
+                        {"episode_media_id": "tt100:1:2", "series_id": "tt100", "season": 1, "episode": 2},
+                    ],
+                )
+
+                worker = BackgroundScraperWorker()
+                with (
+                    patch("comet.background_scraper.worker.database", database),
+                    patch("comet.background_scraper.worker.mark_scope_scraped", AsyncMock()) as mock_mark,
+                ):
+                    episodes = [
+                        {"episode_media_id": "tt100:1:1"},
+                        {"episode_media_id": "tt100:1:2"},
+                    ]
+                    await worker._batch_update_episodes_success(episodes, torrents_found=8)
+
+                    rows = await database.fetch_all(
+                        "SELECT episode_media_id, status, consecutive_failures, total_torrents_found FROM background_scraper_episodes"
+                    )
+                    self.assertEqual(len(rows), 2)
+                    for r in rows:
+                        self.assertEqual(r["status"], "success")
+                        self.assertEqual(r["consecutive_failures"], 0)
+                        self.assertEqual(r["total_torrents_found"], 8)
+
+                    self.assertEqual(mock_mark.await_count, 2)
+            finally:
+                await database.disconnect()
+
+    async def test_scrape_series_season_pack_first_auto_resolves(self):
+        worker = BackgroundScraperWorker()
+        worker.is_running = True
+        worker.metadata_scraper = AsyncMock()
+        worker.metadata_scraper.fetch_aliases_with_metadata = AsyncMock(
+            return_value=({"title": "Test Show", "year": 2024, "year_end": None}, {})
+        )
+
+        episodes = [
+            {"episode_media_id": "tt999:1:1", "series_id": "tt999", "season": 1, "episode": 1, "consecutive_failures": 0},
+            {"episode_media_id": "tt999:1:2", "series_id": "tt999", "season": 1, "episode": 2, "consecutive_failures": 0},
+        ]
+        worker._get_or_discover_episodes = AsyncMock(return_value=episodes)
+        worker._batch_update_episodes_success = AsyncMock()
+        worker._update_episode_state = AsyncMock()
+
+        class FakeParsed:
+            seasons = [1]
+            episodes = []
+
+        class FakeTorrentManager:
+            def __init__(self, *args, **kwargs):
+                self.season = kwargs.get("season")
+                self.episode = kwargs.get("episode")
+                self.torrents = {
+                    "hash_season_pack": {
+                        "parsed": FakeParsed(),
+                        "title": "Test Show S01 1080p Complete",
+                    }
+                }
+
+            async def scrape_torrents(self, context):
+                pass
+
+        with (
+            patch("comet.background_scraper.worker.TorrentManager", FakeTorrentManager),
+            patch.object(settings, "BACKGROUND_SCRAPER_SEASON_PACK_FIRST", True),
+        ):
+            item = {"media_id": "tt999", "title": "Test Show", "year": 2024, "year_end": None}
+            total = await worker._scrape_series(item, deadline=None)
+
+            self.assertEqual(total, 1)
+            # Batch update was called for both episodes at once!
+            worker._batch_update_episodes_success.assert_awaited_once_with(episodes, 1)
+            # Individual episode state update was NOT needed because all were auto-resolved!
+            worker._update_episode_state.assert_not_awaited()
 
 
 if __name__ == "__main__":
