@@ -142,3 +142,29 @@ class StremThruResponseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(raised.exception.payload["error_type"], "RuntimeError")
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+
+    async def test_torbox_direct_batch_availability(self):
+        sample_hash = "D" * 40
+        torbox_payload = {
+            "success": True,
+            "error": None,
+            "data": {
+                sample_hash: {
+                    "hash": sample_hash,
+                    "name": "Movie.2024.1080p",
+                    "files": [
+                        {"id": 1, "name": "Movie.2024.1080p/sample.mkv", "size": 100},
+                        {"id": 2, "name": "Movie.2024.1080p/Movie.2024.1080p.mkv", "size": 5000},
+                    ],
+                }
+            },
+        }
+        response = _ResponseContext(torbox_payload)
+        client = StremThru(_Session(response), None, None, "torbox:test_token", "")
+        prepared, filenames = await client._get_torbox_availability([sample_hash])
+
+        self.assertEqual(filenames, ["Movie.2024.1080p.mkv"])
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0]["info_hash"], sample_hash.lower())
+        self.assertEqual(prepared[0]["files"][0][1], "Movie.2024.1080p.mkv")
+        self.assertEqual(prepared[0]["files"][0][0]["index"], 2)

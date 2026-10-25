@@ -270,6 +270,93 @@ class StremThru:
             )
             return None, 0
 
+    async def _get_torbox_availability(self, torrent_hashes: list):
+        if not torrent_hashes:
+            return [], []
+
+        url = "https://api.torbox.app/v1/api/torrents/checkcached?format=object&list_files=true"
+        headers = {
+            "Authorization": f"Bearer {self.store_token}",
+            "Content-Type": "application/json",
+            "User-Agent": "comet",
+        }
+        payload = {"hashes": torrent_hashes}
+
+        logger.log(
+            "SCRAPER",
+            f"⚡ [TorBox Direct Batch] Querying instant cache for all {len(torrent_hashes)} torrents via POST checkcached...",
+        )
+
+        try:
+            timeout_setting = aiohttp.ClientTimeout(total=10.0)
+            async with self.session.post(
+                url, headers=headers, json=payload, timeout=timeout_setting
+            ) as response:
+                if response.status != 200:
+                    text = await response.text()
+                    logger.warning(
+                        f"TorBox direct checkcached returned HTTP {response.status}: {text}"
+                    )
+                    return [], []
+                result = await response.json()
+        except Exception as e:
+            logger.warning(f"Exception during TorBox direct checkcached: {e}")
+            return [], []
+
+        torbox_data = result.get("data")
+        if not isinstance(torbox_data, dict):
+            return [], []
+
+        prepared = []
+        filenames = []
+
+        for info_hash, torrent in torbox_data.items():
+            if not isinstance(torrent, dict):
+                continue
+
+            info_hash_clean = torrent.get("hash") or info_hash
+            if not isinstance(info_hash_clean, str) or not info_hash_clean:
+                continue
+
+            raw_files = torrent.get("files")
+            if not isinstance(raw_files, list):
+                continue
+
+            prepared_files = []
+            for file in raw_files:
+                if not isinstance(file, dict):
+                    continue
+
+                name = file.get("name") or file.get("short_name")
+                if not isinstance(name, str) or not name:
+                    continue
+
+                filename = name.rsplit("/", 1)[-1]
+                if not is_video(filename) or "sample" in filename.lower():
+                    continue
+
+                file_dict = dict(file)
+                if "index" not in file_dict and "id" in file_dict:
+                    file_dict["index"] = file_dict["id"]
+                file_dict["name"] = filename
+
+                prepared_files.append((file_dict, filename))
+                filenames.append(filename)
+
+            if prepared_files:
+                prepared.append(
+                    {
+                        "info_hash": info_hash_clean.lower(),
+                        "files": prepared_files,
+                    }
+                )
+
+        logger.log(
+            "SCRAPER",
+            f"⚡ [TorBox Direct Batch] Found {len(prepared)} cached torrents ({len(filenames)} playable files) out of {len(torrent_hashes)} checked",
+        )
+        return prepared, filenames
+
     async def get_availability(
         self,
         torrent_hashes: list,
@@ -278,56 +365,34 @@ class StremThru:
         sources_map: dict,
         target_air_date: str | None = None,
     ):
-        await self.check_premium()
+        if not torrent_hashes:
+            return []
 
-        # Sort candidate hashes by seeders descending so the highest quality/most popular torrents are in lot #1
-        def get_seeders(h):
-            val = seeders_map.get(h)
-            return val if isinstance(val, (int, float)) else 0
-
-        sorted_hashes = sorted(
-            torrent_hashes,
-            key=get_seeders,
-            reverse=True,
-        )
-
-        chunk_size = 100
-        chunks = [
-            sorted_hashes[i : i + chunk_size]
-            for i in range(0, len(sorted_hashes), chunk_size)
-        ]
-
-        responses = []
-        is_offcloud = self.store_name == "offcloud"
-        for lot_idx, chunk in enumerate(chunks, start=1):
-            top_s = get_seeders(chunk[0]) if chunk else 0
-            logger.log(
-                "SCRAPER",
-                f"🔎 [TorBox Progressive] Checking lot #{lot_idx}/{len(chunks)} ({len(chunk)} torrents, top seeders: {top_s})...",
+        if self.store_name == "torbox":
+            cached_torrents, filenames_to_parse = await self._get_torbox_availability(
+                torrent_hashes
             )
-            resp = await self.get_instant(chunk)
-            if resp:
-                responses.append(resp)
-                cached_in_lot, _ = _prepare_cached_torrents(
-                    [resp], is_offcloud=is_offcloud
-                )
-                if cached_in_lot:
-                    logger.log(
-                        "SCRAPER",
-                        f"⚡ [TorBox Progressive] Found {len(cached_in_lot)} cached torrents in lot #{lot_idx}! Stopping early (only {min(lot_idx * chunk_size, len(sorted_hashes))}/{len(sorted_hashes)} checked).",
-                    )
-                    break
-                else:
-                    logger.log(
-                        "SCRAPER",
-                        f"⏳ [TorBox Progressive] Lot #{lot_idx} had 0 cached torrents on {self.store_name}. Checking next lot...",
-                    )
+            is_offcloud = False
+        else:
+            await self.check_premium()
 
-        is_offcloud = self.store_name == "offcloud"
-        cached_torrents, filenames_to_parse = _prepare_cached_torrents(
-            responses,
-            is_offcloud=is_offcloud,
-        )
+            chunk_size = 500
+            chunks = [
+                torrent_hashes[i : i + chunk_size]
+                for i in range(0, len(torrent_hashes), chunk_size)
+            ]
+
+            tasks = []
+            for chunk in chunks:
+                tasks.append(self.get_instant(chunk))
+
+            responses = await asyncio.gather(*tasks)
+
+            is_offcloud = self.store_name == "offcloud"
+            cached_torrents, filenames_to_parse = _prepare_cached_torrents(
+                responses,
+                is_offcloud=is_offcloud,
+            )
         requested_series_id, requested_season, requested_episode = (
             self._requested_episode_scope()
         )
